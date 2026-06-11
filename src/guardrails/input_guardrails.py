@@ -5,9 +5,15 @@ Lab 11 — Part 2A: Input Guardrails
   TODO 5: Input Guardrail Plugin (ADK)
 """
 import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from google.genai import types
+# pyrefly: ignore [missing-import]
 from google.adk.plugins import base_plugin
+# pyrefly: ignore [missing-import]
 from google.adk.agents.invocation_context import InvocationContext
 
 from core.config import ALLOWED_TOPICS, BLOCKED_TOPICS
@@ -29,7 +35,10 @@ from core.config import ALLOWED_TOPICS, BLOCKED_TOPICS
 # ============================================================
 
 def detect_injection(user_input: str) -> bool:
-    """Detect prompt injection patterns in user input.
+    """Detect prompt injection patterns before they reach the LLM.
+
+    This layer blocks attempts to override the assistant's role, reveal hidden
+    instructions, or extract credentials before the banking agent responds.
 
     Args:
         user_input: The user's message
@@ -38,9 +47,17 @@ def detect_injection(user_input: str) -> bool:
         True if injection detected, False otherwise
     """
     INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
+        r"ignore (all )?(previous|above|prior) instructions",
+        r"you are now",
+        r"system prompt",
+        r"reveal (your )?(instructions|prompt|secrets?)",
+        r"pretend you are",
+        r"act as (a |an )?unrestricted",
+        r"admin password",
+        r"api key",
+        r"credentials?",
+        r"bỏ qua.*hướng dẫn",
+        r"mật khẩu admin",
     ]
 
     for pattern in INJECTION_PATTERNS:
@@ -62,6 +79,9 @@ def detect_injection(user_input: str) -> bool:
 def topic_filter(user_input: str) -> bool:
     """Check if input is off-topic or contains blocked topics.
 
+    This layer keeps the assistant inside the VinBank banking domain and
+    blocks dangerous topics that may not look like direct prompt injection.
+
     Args:
         user_input: The user's message
 
@@ -70,12 +90,16 @@ def topic_filter(user_input: str) -> bool:
     """
     input_lower = user_input.lower()
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return True
-    # 2. If input doesn't contain any allowed topic -> return True
-    # 3. Otherwise -> return False (allow)
+    if not user_input.strip():
+        return True
 
-    pass  # Replace with your implementation
+    if any(topic in input_lower for topic in BLOCKED_TOPICS):
+        return True
+
+    if not any(topic in input_lower for topic in ALLOWED_TOPICS):
+        return True
+
+    return False
 
 
 # ============================================================
@@ -90,7 +114,12 @@ def topic_filter(user_input: str) -> bool:
 # ============================================================
 
 class InputGuardrailPlugin(base_plugin.BasePlugin):
-    """Plugin that blocks bad input before it reaches the LLM."""
+    """Plugin that blocks unsafe input before it reaches the LLM.
+
+    It combines prompt-injection detection and topic filtering so risky
+    requests are rejected before the model can reveal internal information or
+    answer outside the banking domain.
+    """
 
     def __init__(self):
         super().__init__(name="input_guardrail")
@@ -121,6 +150,10 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
     ) -> types.Content | None:
         """Check user message before sending to the agent.
 
+        Injection is checked first because those attacks may include banking
+        words such as account, API key, or admin password. Topic filtering then
+        catches unrelated or dangerous non-banking requests.
+
         Returns:
             None if message is safe (let it through),
             types.Content if message is blocked (return replacement)
@@ -128,14 +161,21 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If True: increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If True: increment blocked_count, return self._block_response("...")
-        # 3. If both are False: return None (let message through)
+        if detect_injection(text):
+            self.blocked_count += 1
+            return self._block_response(
+                "I cannot process requests that attempt to override instructions "
+                "or reveal internal information."
+            )
 
-        pass  # Replace with your implementation
+        if topic_filter(text):
+            self.blocked_count += 1
+            return self._block_response(
+                "I'm a VinBank assistant and can only help with banking-related "
+                "questions."
+            )
+
+        return None
 
 
 # ============================================================
@@ -196,10 +236,6 @@ async def test_input_plugin():
 
 
 if __name__ == "__main__":
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
     test_injection_detection()
     test_topic_filter()
     import asyncio

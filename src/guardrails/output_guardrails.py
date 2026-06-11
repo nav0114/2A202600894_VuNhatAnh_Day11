@@ -5,11 +5,17 @@ Lab 11 — Part 2B: Output Guardrails
   TODO 8: Output Guardrail Plugin (ADK)
 """
 import re
-import textwrap
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from google.genai import types
+# pyrefly: ignore [missing-import]
 from google.adk.agents import llm_agent
+# pyrefly: ignore [missing-import]
 from google.adk import runners
+# pyrefly: ignore [missing-import]
 from google.adk.plugins import base_plugin
 
 from core.utils import chat_with_agent
@@ -30,6 +36,10 @@ from core.utils import chat_with_agent
 def content_filter(response: str) -> dict:
     """Filter response for PII, secrets, and harmful content.
 
+    This output layer is needed because the LLM may still leak customer data,
+    internal credentials, or infrastructure details even if the input looked
+    safe enough to process.
+
     Args:
         response: The LLM's response text
 
@@ -41,12 +51,13 @@ def content_filter(response: str) -> dict:
 
     # PII patterns to check
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "phone_number": r"\b0\d{9,10}\b",
+        "email": r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}",
+        "national_id": r"\b\d{9}\b|\b\d{12}\b",
+        "api_key": r"sk-[a-zA-Z0-9-]+",
+        "password": r"\b(?:admin\s+)?password\s*(?:is|[:=])\s*\S+",
+        "internal_host": r"\b[\w.-]+\.internal(?::\d+)?\b",
+        "database_connection": r"\b(?:postgres|mysql|mongodb)://\S+",
     }
 
     for name, pattern in PII_PATTERNS.items():
@@ -89,20 +100,20 @@ Respond with ONLY one word: SAFE or UNSAFE
 If UNSAFE, add a brief reason on the next line.
 """
 
-# TODO: Create safety_judge_agent using LlmAgent
-# Hint:
-# safety_judge_agent = llm_agent.LlmAgent(
-#     model="gemini-2.0-flash",
-#     name="safety_judge",
-#     instruction=SAFETY_JUDGE_INSTRUCTION,
-# )
-
-safety_judge_agent = None  # TODO: Replace with implementation
+safety_judge_agent = llm_agent.LlmAgent(
+    model="gemini-2.5-flash-lite",
+    name="safety_judge",
+    instruction=SAFETY_JUDGE_INSTRUCTION,
+)
 judge_runner = None
 
 
 def _init_judge():
-    """Initialize the judge agent and runner (call after creating the agent)."""
+    """Initialize the judge agent and runner.
+
+    The judge is a separate model call that catches broader unsafe responses
+    such as leaked internal information, irrelevant advice, or hallucinations.
+    """
     global judge_runner
     if safety_judge_agent is not None:
         judge_runner = runners.InMemoryRunner(
@@ -112,6 +123,9 @@ def _init_judge():
 
 async def llm_safety_check(response_text: str) -> dict:
     """Use LLM judge to check if response is safe.
+
+    Regex redaction catches exact patterns; the LLM judge catches riskier
+    semantic cases that do not match a simple regular expression.
 
     Args:
         response_text: The agent's response to evaluate
@@ -141,7 +155,11 @@ async def llm_safety_check(response_text: str) -> dict:
 # ============================================================
 
 class OutputGuardrailPlugin(base_plugin.BasePlugin):
-    """Plugin that checks agent output before sending to user."""
+    """Plugin that checks agent output before sending to user.
+
+    It first redacts deterministic PII/secret patterns, then optionally runs
+    an independent LLM-as-Judge to block unsafe responses that regex may miss.
+    """
 
     def __init__(self, use_llm_judge=True):
         super().__init__(name="output_guardrail")
@@ -159,29 +177,46 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
                     text += part.text
         return text
 
+    def _replace_response_text(self, llm_response, text: str):
+        """Replace response text while preserving the ADK response object."""
+        llm_response.content = types.Content(
+            role="model",
+            parts=[types.Part.from_text(text=text)],
+        )
+        return llm_response
+
     async def after_model_callback(
         self,
         *,
         callback_context,
         llm_response,
     ):
-        """Check LLM response before sending to user."""
+        """Check and possibly rewrite the LLM response before sending it."""
         self.total_count += 1
 
         response_text = self._extract_text(llm_response)
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        filter_result = content_filter(response_text)
+        checked_text = response_text
 
-        return llm_response  # TODO: modify if needed
+        if not filter_result["safe"]:
+            self.redacted_count += 1
+            checked_text = filter_result["redacted"]
+            self._replace_response_text(llm_response, checked_text)
+
+        if self.use_llm_judge:
+            judge_result = await llm_safety_check(checked_text)
+            if not judge_result["safe"]:
+                self.blocked_count += 1
+                return self._replace_response_text(
+                    llm_response,
+                    "I cannot provide that response because it may expose unsafe "
+                    "or internal information.",
+                )
+
+        return llm_response
 
 
 # ============================================================
@@ -206,8 +241,4 @@ def test_content_filter():
 
 
 if __name__ == "__main__":
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
     test_content_filter()
